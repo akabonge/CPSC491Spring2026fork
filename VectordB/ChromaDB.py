@@ -30,13 +30,20 @@ import datetime
 import logging
 import html
 import tempfile
+import sys
 from uuid import uuid4
 from typing import List, Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
+# Add parent directory to path to import config
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import mimetypes
 import requests
-import fitz  # PyMuPDF
+try:
+    import pymupdf as fitz  # PyMuPDF (newer import style)
+except ImportError:
+    import fitz  # PyMuPDF (older import style)
 import numpy as np
 from tqdm import tqdm
 from newspaper import Article
@@ -86,7 +93,10 @@ DEFAULT_SEARCH_QUERIES = [
 ]
 
 
-PERSIST_PATH = os.environ.get("CHROMA_PERSIST_PATH", "./chroma_fcc_storage")
+# Use absolute path to chroma storage in parent directory
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.dirname(SCRIPT_DIR)
+PERSIST_PATH = os.environ.get("CHROMA_PERSIST_PATH", os.path.join(PARENT_DIR, "chroma_fcc_storage"))
 COLLECTION_NAME = os.environ.get("CHROMA_COLLECTION", "fcc_documents")
 
 client = PersistentClient(path=PERSIST_PATH)

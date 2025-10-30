@@ -11,26 +11,54 @@ Features:
 - Explicit guardrails to avoid hallucinating beyond sources.
 - Retries on transient API errors.
 """
+import pathlib
+import sys
 
+ROOT = pathlib.Path(__file__).resolve().parents[1]  # parent of VectordB or ingestion
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+    
 from config import  get_api_key, get_serpapi_key
 import os
-import sys
 import time
+import datetime
 from typing import List, Dict, Tuple
+ 
+
+
 
 from chromadb import PersistentClient
 from openai import OpenAI
 from serpapi import GoogleSearch
+from uuid import uuid4
+import numpy as np
 
 # === Configuration ===
 
-PERSIST_PATH = os.environ.get("CHROMA_PERSIST_PATH", "./chroma_storage")
-COLLECTION_NAME = os.environ.get("CHROMA_COLLECTION", "regulatory_papers")
+PERSIST_PATH = os.environ.get("CHROMA_PERSIST_PATH", "./chroma_fcc_storage")
+COLLECTION_NAME = os.environ.get("CHROMA_COLLECTION", "fcc_documents")
 EMBED_MODEL = "text-embedding-3-small"
 SIMILARITY_TOP_K = 5
 MAX_RESPONSE_TOKENS = 500
 SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
 FALLBACK_TEXT = "No information available in the dataset or external sources for that question."
+RELEVANCE_THRESHOLD = 0.35  # Cosine similarity threshold for topic relevance
+
+# Reference topics for emergency alerting systems
+EMERGENCY_TOPICS = [
+    "emergency alert system EAS wireless emergency alerts WEA",
+    "integrated public alert warning system IPAWS disaster response",
+    "Federal Communications Commission FCC public safety communications",
+    "emergency management FEMA cybersecurity policy national security",
+    "emergency broadcast system disaster preparedness crisis communication",
+    "public warning systems emergency notifications alert infrastructure",
+    "emergency response protocols homeland security critical infrastructure"
+]
+
+# Ingestion-like params for saving external sources
+MIN_ARTICLE_LENGTH = 300
+CHUNK_SIZE = 2000
+CHUNK_OVERLAP = 200
 
 # === Clients ===
 
@@ -46,11 +74,77 @@ def get_openai_client():
 
 openai_client = get_openai_client()
 
+# Pre-compute embeddings for emergency topics (cached for efficiency)
+_topic_embeddings_cache = None
+
+def get_topic_embeddings() -> List[List[float]]:
+    """Get or compute embeddings for emergency topics (cached)."""
+    global _topic_embeddings_cache
+    if _topic_embeddings_cache is None:
+        #print("🔄 Computing reference embeddings for emergency topics...")
+        _topic_embeddings_cache = [embed_text(topic) for topic in EMERGENCY_TOPICS]
+    return _topic_embeddings_cache
+
 # === Embedding & Retrieval ===
 
 def embed_text(text: str) -> List[float]:
     resp = openai_client.embeddings.create(model=EMBED_MODEL, input=text)
     return resp.data[0].embedding
+
+def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    """Calculate cosine similarity between two vectors."""
+    v1 = np.array(vec1)
+    v2 = np.array(vec2)
+    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+
+def is_relevant_to_emergency_systems(query: str) -> Tuple[bool, float]:
+    """
+    Check if the query is relevant to emergency alerting systems using cosine similarity.
+    Returns (is_relevant, max_similarity_score).
+    """
+    try:
+        # Get query embedding
+        query_embedding = embed_text(query)
+        
+        # Get pre-computed topic embeddings
+        topic_embeddings = get_topic_embeddings()
+        
+        # Calculate similarity with each emergency topic
+        similarities = [cosine_similarity(query_embedding, topic_emb) 
+                       for topic_emb in topic_embeddings]
+        
+        # Get maximum similarity
+        max_similarity = max(similarities)
+        
+        # Check if above threshold
+        is_relevant = max_similarity >= RELEVANCE_THRESHOLD
+        
+        return is_relevant, max_similarity
+        
+    except Exception as e:
+        print(f"⚠️ Relevance check error: {e}")
+        # Default to allowing the question if check fails
+        return True, 1.0
+
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    """Batch embed helper to reduce API calls."""
+    if not texts:
+        return []
+    resp = openai_client.embeddings.create(model=EMBED_MODEL, input=texts)
+    return [r.embedding for r in resp.data]
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    if len(text) <= chunk_size:
+        return [text]
+    chunks: List[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        if end == len(text):
+            break
+        start = end - overlap
+    return chunks
 
 def retrieve_relevant_chunks(query: str, top_k: int = SIMILARITY_TOP_K) -> List[Dict]:
     q_emb = embed_text(query)
@@ -104,17 +198,61 @@ def fetch_full_text(url: str) -> str:
     except Exception:
         return ""
 
+def save_external_docs_to_chroma(external_docs: List[Dict]) -> None:
+    """Save external docs (with full text content) into ChromaDB as chunks with embeddings."""
+    batched_ids: List[str] = []
+    batched_docs: List[str] = []
+    batched_embs: List[List[float]] = []
+    batched_meta: List[Dict] = []
+
+    for d in external_docs:
+        url = d.get("url", "")
+        title = d.get("title", "External Source")
+        content = d.get("content", "")
+        if not url or not content or len(content) < MIN_ARTICLE_LENGTH:
+            continue
+
+        chunks = chunk_text(content)
+        embeddings = embed_texts(chunks)
+
+        today = str(datetime.date.today())
+        for idx, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+            batched_ids.append(str(uuid4()))
+            batched_docs.append(chunk)
+            batched_embs.append(emb)
+            batched_meta.append({
+                "source": url,
+                "title": title,
+                "retrieved": today,
+                "chunk_index": idx,
+            })
+
+    if batched_ids:
+        try:
+            collection.add(
+                ids=batched_ids,
+                documents=batched_docs,
+                embeddings=batched_embs,
+                metadatas=batched_meta,
+            )
+        except Exception as e:
+            # Non-fatal: continue chat even if persistence fails
+            print(f"⚠️ Failed saving external docs to ChromaDB: {e}")
+
 # === Prompt Construction ===
 
 def build_prompt(query: str,
                  embedded_chunks: List[Dict],
                  external_docs: List[Dict]) -> str:
     system_instructions = (
-        "You are a helpful assistant that specializes in emergency alert systems, public safety communications, cybersecurity policy, "
-        "disaster response frameworks, and regulatory principles. You have access to embedded documents and relevant web sources.\n\n"
-        "Use the provided context to guide your answers, but you may also use your own knowledge when helpful. Be clear, accurate, and concise.\n\n"
-        "When you cite a document or source explicitly, include a markdown-formatted list at the end under the heading '📚 Sources:', with the title and link.\n\n"
-        "If there's no relevant context provided, still try to help the user based on what you know."
+        "You are an expert on emergency alert systems (EAS, WEA, IPAWS), public safety communications, and regulatory frameworks. "
+        "Provide detailed, specific answers using the context below.\n\n"
+        "Guidelines:\n"
+        "- Include specific details: dates, names, statistics, and technical terms (EAS, WEA, IPAWS, CAP, FCC Part 11)\n"
+        "- Cite sources using the format: 'According to [document/source]...'\n"
+        "- Provide examples and context when helpful\n"
+        "- List all sources at the end under '📚 Sources:' with markdown links\n"
+        "- If context is insufficient, supplement with your knowledge but indicate this clearly"
     )
 
     parts = []
@@ -160,6 +298,11 @@ def parse_sources(answer: str) -> Tuple[str, List[Tuple[str, str]]]:
 
 def chat():
     print("Chat Assistant (type 'exit' or Ctrl-C to quit)")
+    try:
+        initial_count = collection.count()
+        print(f"🔢 ChromaDB total embeddings at start: {initial_count}")
+    except Exception as e:
+        print(f"⚠️ Could not retrieve initial ChromaDB count: {e}")
 
     while True:
         try:
@@ -168,6 +311,15 @@ def chat():
                 print("Goodbye!")
                 break
 
+            # Check if question is relevant to emergency systems using cosine similarity
+            is_relevant, similarity_score = is_relevant_to_emergency_systems(user_input)
+            
+            if not is_relevant:
+                print(f"\n🚫 I can only assist with questions related to emergency alert systems, "
+                      "public safety communications, disaster response, cybersecurity policy, "
+                      "and related regulatory topics. Please ask a question within my area of expertise.")
+                continue
+
             embedded_chunks = retrieve_relevant_chunks(user_input)
             external_docs = external_search(user_input)
 
@@ -175,6 +327,27 @@ def chat():
                 full = fetch_full_text(d["url"])
                 if full:
                     d["content"] = full
+
+            # Persist the fetched external sources into ChromaDB
+            try:
+                before_cnt = None
+                try:
+                    before_cnt = collection.count()
+                except Exception:
+                    pass
+                save_external_docs_to_chroma(external_docs)
+                if before_cnt is not None:
+                    try:
+                        after_cnt = collection.count()
+                        added = after_cnt - before_cnt
+                        if added > 0:
+                            print(f"✅ Added {added} embeddings to ChromaDB. Total now: {after_cnt}")
+                        else:
+                            print(f"ℹ️ No new embeddings added. Total remains: {after_cnt}")
+                    except Exception as e:
+                        print(f"⚠️ Could not compute added embeddings: {e}")
+            except Exception as e:
+                print(f"⚠️ Error while saving external sources: {e}")
 
             if not embedded_chunks and not external_docs:
                 print(f"Assistant: {FALLBACK_TEXT}")
