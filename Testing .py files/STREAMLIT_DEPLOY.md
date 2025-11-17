@@ -12,7 +12,7 @@
 ### 3. Create New App
 - Click **"New app"** button
 - Fill in the form:
-  - **Repository**: `MurtazaSFakhry/CPSC491Fall2025-MyVersion`
+  - **Repository**: ``
   - **Branch**: `main`
   - **Main file path**: `VectordB/streamlit_app.py`
 
