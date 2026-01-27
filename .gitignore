@@ -6,3 +6,13 @@ __pycache__/
 # Ignore local Chroma storage (using Pinecone in cloud)
 chroma_fcc_storage/
 VectordB/chroma_fcc_storage/
+
+# --- RAG Sprint 1 ---
+.env
+.venv/
+__pycache__/
+*.pyc
+data/reviews_clean.json
+data/chunks.jsonl
+data/
+
