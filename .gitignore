@@ -53,3 +53,7 @@ data/*.csv
 # optional: if you keep other big artifacts
 *.bak
 
+
+# Windows Zone Identifier alternate data streams
+*:Zone.Identifier
+
