@@ -1,219 +1,252 @@
+"""
+Streamlit UI for Customer Review Insights Bot (Crimson Coward)
+
+Usage:
+  streamlit run streamlit_app.py
+"""
+import os
 import json
 import streamlit as st
+from dotenv import load_dotenv
+
+# Your existing RAG function
 from app.rag import generate_grounded_response
 
-st.set_page_config(page_title="Customer Review Insights Bot", layout="wide")
+load_dotenv()
 
-st.title("Customer Review Insights Bot")
-st.caption("Ask a question about your reviews. The bot retrieves relevant chunks and generates a grounded response.")
+st.set_page_config(
+    page_title="Customer Review Insights Bot",
+    page_icon="🍗",
+    layout="wide",
+)
 
-# ----------------------------
-# Sidebar (minimal)
-# ----------------------------
-with st.sidebar:
-    st.header("Settings")
+# Optional: show Pinecone stats in sidebar (safe if pinecone installed)
+try:
+    from pinecone import Pinecone
+except Exception:
+    Pinecone = None
 
-    top_k = st.slider("Retrieved chunks (top_k)", 3, 30, 8, 1)
-    min_recurring = st.slider("Min recurring count", 1, 6, 2, 1)
 
-    show_evidence = st.toggle("Show evidence", value=True)
-    show_ops = st.toggle("Show ops recommendations", value=True)
-    show_sms = st.toggle("Show SMS draft", value=True)
-
-    # Keep debug truly optional + hidden
-    with st.expander("Advanced"):
-        include_debug = st.checkbox("Include debug block", value=False)
-        st.caption("Tip: Keep Advanced off for demos.")
-
-# ----------------------------
-# Session state (chat history)
-# ----------------------------
-if "history" not in st.session_state:
-    st.session_state.history = []  # list of dicts: {"q":..., "out":...}
-
-# ----------------------------
-# Chat input
-# ----------------------------
-with st.container():
-    st.subheader("Ask a question")
-    with st.form("ask_form", clear_on_submit=False):
-        q = st.text_input(
-            label="",
-            placeholder="e.g., What themes come up about service speed?",
-            value="What themes come up about service speed?",
-        )
-        submitted = st.form_submit_button("Run analysis", type="primary")
-
-# ----------------------------
-# Run
-# ----------------------------
-if submitted and q.strip():
+def _safe_index_stats() -> dict | None:
+    """Try to read Pinecone index stats (optional)."""
+    pinecone_key = os.getenv("PINECONE_API_KEY")
+    index_name = os.getenv("PINECONE_INDEX")
+    if not pinecone_key or not index_name or Pinecone is None:
+        return None
     try:
-        with st.spinner("Retrieving + generating grounded response..."):
-            out = generate_grounded_response(
-                query=q.strip(),
-                top_k=int(top_k),
-                min_recurring_reviews=int(min_recurring),
-                include_debug=bool(include_debug),
-            )
-    except Exception as e:
-        st.error("Something went wrong while running the analysis.")
-        st.exception(e)
-        st.stop()
+        pc = Pinecone(api_key=pinecone_key)
+        index = pc.Index(index_name)
+        stats = index.describe_index_stats()
+        if isinstance(stats, dict):
+            return stats
+        return getattr(stats, "to_dict", lambda: None)()
+    except Exception:
+        return None
 
-    if not isinstance(out, dict):
-        st.error("Unexpected output type (expected dict).")
-        st.write(out)
-        st.stop()
 
-    # Store in history (latest first)
-    st.session_state.history.insert(0, {"q": q.strip(), "out": out})
+def render_sources_from_output(out: dict) -> None:
+    """
+    Render evidence chunk IDs from out's theme evidence + recurring issues + ops recs.
+    This keeps the UI clean while still showing grounding.
+    """
+    # Collect chunk IDs from multiple places
+    chunk_ids = set()
 
-# ----------------------------
-# Render a single response card
-# ----------------------------
-def render_response_card(q: str, out: dict):
-    # Header
-    st.markdown(f"### ❓ {q}")
+    for th in out.get("top_themes", []) or []:
+        for e in th.get("evidence", []) or []:
+            cid = e.get("chunk_id")
+            if cid:
+                chunk_ids.add(str(cid))
 
-    # Main answer (clean + demo-friendly)
-    ans = out.get("answer_summary", "")
-    if ans:
-        st.markdown("**Answer**")
-        st.write(ans)
+    for it in out.get("recurring_issues", []) or []:
+        for cid in it.get("evidence_chunk_ids", []) or []:
+            chunk_ids.add(str(cid))
 
-    # Overall sentiment (compact)
-    osent = out.get("overall_sentiment") or {}
-    if osent:
-        st.markdown(
-            f"**Overall sentiment:** `{osent.get('label', 'mixed')}` — {osent.get('rationale','')}"
-        )
+    for r in out.get("ops_recommendations", []) or []:
+        for cid in r.get("grounding_chunk_ids", []) or []:
+            chunk_ids.add(str(cid))
 
-    # Tabs for optional detail (keeps UI uncluttered)
-    tabs = st.tabs(["Themes", "Issues", "SMS", "Ops", "Evidence", "Raw JSON"])
+    if not chunk_ids:
+        st.caption("Sources: (none returned)")
+        return
 
-    # THEMES
-    with tabs[0]:
-        themes = out.get("top_themes", []) or []
-        if not themes:
-            st.info("No themes returned.")
-        else:
-            for th in themes:
-                theme_name = th.get("theme", "Theme")
-                sent = th.get("sentiment", "mixed")
-                with st.expander(f"{theme_name}  •  sentiment: {sent}", expanded=False):
-                    evidence = th.get("evidence", []) or []
-                    if not evidence:
-                        st.write("_No evidence provided for this theme._")
-                    else:
-                        for e in evidence:
-                            cid = e.get("chunk_id", "")
-                            excerpt = e.get("excerpt", "")
-                            st.markdown(f"- `{cid}` — {excerpt}")
+    st.caption("Sources (chunk IDs)")
+    st.code("\n".join(sorted(chunk_ids)))
 
-    # ISSUES
-    with tabs[1]:
-        recurring = out.get("recurring_issues", []) or []
-        isolated = out.get("isolated_issues", []) or []
 
-        if not recurring and not isolated:
-            st.info("No issues returned.")
-        else:
-            if recurring:
-                st.markdown("**Recurring issues**")
-                for i, it in enumerate(recurring, 1):
+def render_response_clean(out: dict, show_details: bool, show_debug: bool) -> None:
+    """Render assistant response in a clean way (demo-friendly)."""
+    # Main
+    summary = out.get("answer_summary", "")
+    if summary:
+        st.markdown(summary)
+    else:
+        st.markdown("_No summary returned._")
+
+    # Expandable details
+    if show_details:
+        with st.expander("Details (themes, issues, SMS, ops)", expanded=False):
+            # Overall sentiment
+            osent = out.get("overall_sentiment") or {}
+            if osent:
+                st.markdown(f"**Overall sentiment:** `{osent.get('label', 'mixed')}`")
+                if osent.get("rationale"):
+                    st.write(osent["rationale"])
+
+            # Themes
+            themes = out.get("top_themes", []) or []
+            if themes:
+                st.markdown("### Themes")
+                for th in themes:
+                    theme_name = th.get("theme", "Theme")
+                    sent = th.get("sentiment", "mixed")
+                    with st.expander(f"{theme_name} • sentiment: {sent}", expanded=False):
+                        evidence = th.get("evidence", []) or []
+                        if not evidence:
+                            st.write("_No evidence provided._")
+                        else:
+                            for e in evidence:
+                                cid = e.get("chunk_id", "")
+                                excerpt = e.get("excerpt", "")
+                                st.markdown(f"- `{cid}` — {excerpt}")
+
+            # Issues
+            issues = out.get("recurring_issues", []) or []
+            if issues:
+                st.markdown("### Recurring issues")
+                for i, it in enumerate(issues, 1):
                     issue = it.get("issue", "")
                     ids = it.get("evidence_chunk_ids", []) or []
                     ucnt = it.get("unique_review_count")
-                    with st.expander(f"{i}. {issue}", expanded=False):
-                        if ucnt is not None:
-                            st.write(f"Unique review count: `{ucnt}`")
-                        if ids:
-                            st.caption("Evidence chunk IDs")
-                            st.code("\n".join(ids))
+                    st.markdown(f"**{i}. {issue}**")
+                    if ucnt is not None:
+                        st.caption(f"Unique review count: {ucnt}")
+                    if ids:
+                        st.code("\n".join(ids))
 
-            if isolated:
-                st.markdown("**Isolated issues**")
-                for i, it in enumerate(isolated, 1):
-                    issue = it.get("issue", "")
-                    ids = it.get("evidence_chunk_ids", []) or []
-                    with st.expander(f"{i}. {issue}", expanded=False):
-                        if ids:
-                            st.caption("Evidence chunk IDs")
-                            st.code("\n".join(ids))
-
-    # SMS
-    with tabs[2]:
-        if not show_sms:
-            st.info("SMS draft hidden (toggle on in sidebar).")
-        else:
+            # SMS
             sms = out.get("sms_draft") or {}
             msgs = sms.get("messages", []) or []
             counts = sms.get("character_counts", []) or []
-            if not msgs:
-                st.info("No SMS draft returned.")
-            else:
+            if msgs:
+                st.markdown("### Draft SMS")
                 for i, m in enumerate(msgs, 1):
                     c = counts[i - 1] if (i - 1) < len(counts) else len(m)
                     st.markdown(f"**Message {i}** ({c} chars)")
                     st.code(m)
 
-    # OPS
-    with tabs[3]:
-        if not show_ops:
-            st.info("Ops recommendations hidden (toggle on in sidebar).")
-        else:
+            # Ops recommendations
             recs = out.get("ops_recommendations", []) or []
-            if not recs:
-                st.info("No ops recommendations returned.")
-            else:
+            if recs:
+                st.markdown("### Ops recommendations")
                 for i, r in enumerate(recs, 1):
                     rec = r.get("recommendation", "")
                     ids = r.get("grounding_chunk_ids", []) or []
-                    with st.expander(f"{i}. {rec}", expanded=False):
-                        if ids:
-                            st.caption("Grounding chunk IDs")
-                            st.code("\n".join(ids))
+                    st.markdown(f"**{i}. {rec}**")
+                    if ids:
+                        st.caption("Grounding chunk IDs")
+                        st.code("\n".join(ids))
 
-    # EVIDENCE + DEBUG (only if you want it)
-    with tabs[4]:
-        if not show_evidence:
-            st.info("Evidence hidden (toggle on in sidebar).")
-        else:
-            # If your rag.py returns a debug block with retrieved chunks, show it nicely
-            dbg = out.get("debug", {}) or {}
-            retrieved = dbg.get("retrieved", []) or dbg.get("contexts", []) or []
-            if retrieved:
-                st.markdown("**Retrieved chunks (debug)**")
-                for c in retrieved:
-                    cid = c.get("id") or c.get("chunk_id") or ""
-                    score = c.get("score")
-                    rating = c.get("rating")
-                    date = c.get("date")
-                    text = (c.get("text") or "").strip()
-                    with st.expander(f"{cid}  •  score={score}  •  rating={rating}  •  date={date}", expanded=False):
-                        st.write(text)
+            # Sources
+            st.divider()
+            render_sources_from_output(out)
+
+    # Debug (hidden unless toggled)
+    if show_debug:
+        with st.expander("Debug JSON", expanded=False):
+            st.json(out.get("debug", {}))
+        with st.expander("Raw output JSON", expanded=False):
+            st.code(json.dumps(out, ensure_ascii=False, indent=2), language="json")
+
+
+def main():
+    st.title("🍗 Customer Review Insights Bot")
+    st.markdown("Ask questions about your review dataset. The bot retrieves relevant chunks and generates grounded insights.")
+
+    # Sidebar (like your example app)
+    with st.sidebar:
+        st.header("📊 System Stats")
+
+        pinecone_index_name = os.getenv("PINECONE_INDEX", "(not set)")
+        st.success(f"Pinecone index: {pinecone_index_name}")
+
+        stats = _safe_index_stats()
+        if stats and isinstance(stats, dict):
+            total = stats.get("total_vector_count")
+            dim = stats.get("dimension")
+            if total is not None:
+                st.info(f"Vectors: {total:,}")
+            if dim is not None:
+                st.info(f"Dimension: {dim}")
+
+        st.divider()
+        st.header("⚙️ Controls")
+        top_k = st.slider("top_k", min_value=3, max_value=30, value=8, step=1)
+        min_recurring = st.slider("min_recurring_reviews", min_value=1, max_value=6, value=2, step=1)
+
+        st.divider()
+        st.header("🧾 Display")
+        show_details = st.checkbox("Show details (themes/issues/SMS/ops)", value=True)
+        show_debug = st.checkbox("Show debug/raw JSON", value=False)
+
+        st.divider()
+        st.caption("Environment required:")
+        st.code(
+            "OPENAI_API_KEY\nPINECONE_API_KEY\nPINECONE_INDEX\n"
+            "OPENAI_MODEL (optional)\nOPENAI_EMBED_MODEL (optional)",
+            language="text",
+        )
+
+    # Chat history
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # Render existing chat
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            if msg["role"] == "assistant" and isinstance(msg.get("payload"), dict):
+                render_response_clean(msg["payload"], show_details=show_details, show_debug=show_debug)
             else:
-                st.info("No retrieved chunk list found in debug output. (This is fine for demo mode.)")
+                st.markdown(msg.get("content", ""))
 
-            if include_debug:
-                st.divider()
-                st.markdown("**Debug block**")
-                st.json(out.get("debug", {}))
+    # Chat input
+    prompt = st.chat_input("Ask about the reviews (e.g., 'What themes come up about service speed?')")
+    if prompt:
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-    # RAW JSON
-    with tabs[5]:
-        st.code(json.dumps(out, ensure_ascii=False, indent=2), language="json")
+        # Generate assistant response
+        with st.chat_message("assistant"):
+            with st.spinner("🔍 Retrieving + generating grounded response..."):
+                try:
+                    out = generate_grounded_response(
+                        query=prompt,
+                        top_k=int(top_k),
+                        min_recurring_reviews=int(min_recurring),
+                        include_debug=bool(show_debug),
+                    )
+                except TypeError:
+                    # If your generate_grounded_response doesn't support these args yet,
+                    # fall back to the older signature.
+                    out = generate_grounded_response(prompt, top_k=int(top_k))
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                    out = {"answer_summary": "An error occurred while generating the response."}
 
-    st.divider()
+            if not isinstance(out, dict):
+                st.error("Unexpected output (expected dict).")
+                st.write(out)
+                return
+
+            render_response_clean(out, show_details=show_details, show_debug=show_debug)
+
+        # Store assistant message
+        st.session_state.messages.append(
+            {"role": "assistant", "content": "", "payload": out}
+        )
 
 
-# ----------------------------
-# Render history (latest first)
-# ----------------------------
-if st.session_state.history:
-    st.subheader("Results")
-    for item in st.session_state.history:
-        render_response_card(item["q"], item["out"])
-else:
-    st.info("Ask a question to begin.")
+if __name__ == "__main__":
+    main()
